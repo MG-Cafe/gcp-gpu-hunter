@@ -5,7 +5,10 @@ Ultra-Fast 1-VM Sniper & Multi-Zone Parallel GPU Reservation Hunter (Python REST
 Customer Default Configuration (runs out-of-the-box with zero arguments):
   - Host Project:      prj-d-gai-launchpad
   - Shared Project:    prj-d-gai-aipgaisvc-1 (SPECIFIC_PROJECTS + ALLOW_ALL)
-  - Target Quantity:   3 VMs total, hunted 1 VM at a time (--vm-count=1)
+  - Target Quantity:   9 more VMs by default (12 total desired - 3 already secured),
+                       hunted 1 VM at a time (--vm-count=1) with incremental lock-in:
+                       every single 1-VM hit is immediately active and kept ("grab as
+                       many as available right now"), even if stopped early via Ctrl+C.
   - Default Chip/SKU:  a3-highgpu-8g (8x nvidia-h100-80gb)
   - Default Regions:   us-east4, us-central1 -> Automatically expands to all available
                        a3-highgpu-8g zones in those 2 regions (priority-ordered):
@@ -20,6 +23,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -32,7 +36,10 @@ import urllib.request
 # ==============================================================================
 PROJECT_ID = os.environ.get("PROJECT_ID", "prj-d-gai-launchpad")
 SHARE_WITH_PROJECT = os.environ.get("SHARE_WITH_PROJECT", "prj-d-gai-aipgaisvc-1")
-TARGET_VM_COUNT = int(os.environ.get("TARGET_VM_COUNT", "3"))
+
+# Customer wants 12 nodes total and already got 3 -> hunt up to 9 more by default
+# (Every 1-VM reservation is locked in immediately as soon as it hits)
+TARGET_VM_COUNT = int(os.environ.get("TARGET_VM_COUNT", "9"))
 PER_RESERVATION_VM_COUNT = int(os.environ.get("PER_RESERVATION_VM_COUNT", "1"))
 
 DEFAULT_MACHINE_TYPES = os.environ.get("MACHINE_TYPES", "a3-highgpu-8g")
@@ -363,12 +370,14 @@ def run_parallel_wave(
     tier: dict,
     vm_count: int,
     needed_vms: int,
+    already_secured_vms: int,
     token_mgr: TokenManager,
 ):
     zones = list(tier["zones"])
     zone_rank = {z: idx for idx, z in enumerate(zones)}
     successes = []
     dead_zones = set()
+    quota_full_regions = set()
     rate_limited = False
     wave_lock = threading.Lock()
     wave_secured = 0
@@ -389,9 +398,13 @@ def run_parallel_wave(
             if ok:
                 with wave_lock:
                     wave_secured += count
+                    total_now = already_secured_vms + wave_secured
                     successes.append((zone, res_name, count))
-                tag = "[HIT] " if burst_idx == 0 else "[HOT-ZONE HIT!]"
-                log(f"  {tag} {zone}: Reserved {count}x {tier['machine_type']} -> {res_name}")
+                tag = "[HIT]" if burst_idx == 0 else "[HOT-ZONE HIT!]"
+                log(
+                    f"  {tag} {zone}: Locked in {count}x {tier['machine_type']} -> {res_name} "
+                    f"(Grabbed {min(total_now, TARGET_VM_COUNT)}/{TARGET_VM_COUNT} VMs — active & ready now!)"
+                )
                 burst_idx += 1
                 with wave_lock:
                     if wave_secured < needed_vms:
@@ -407,6 +420,10 @@ def run_parallel_wave(
                 ):
                     with wave_lock:
                         dead_zones.add(zone)
+                elif "quota_exceeded" in reason_lower or "quota" in reason_lower and "exceeded" in reason_lower:
+                    if vm_count == 1:
+                        with wave_lock:
+                            quota_full_regions.add(zone.rsplit("-", 1)[0])
                 short_reason = (
                     f"STOCKOUT ({reason})"
                     if ("exhausted" in reason_lower or "stockout" in reason_lower or "does not have enough" in reason_lower)
@@ -427,6 +444,13 @@ def run_parallel_wave(
         tier["zones"] = [z for z in tier["zones"] if z not in dead_zones]
         log(f"  [Auto-Prune] Dropped {len(dead_zones)} zero-quota/unsupported zone(s): {', '.join(sorted(dead_zones))}")
 
+    if quota_full_regions:
+        before_cnt = len(tier["zones"])
+        tier["zones"] = [z for z in tier["zones"] if z.rsplit("-", 1)[0] not in quota_full_regions]
+        dropped_cnt = before_cnt - len(tier["zones"])
+        if dropped_cnt > 0:
+            log(f"  [Quota-Full] Regional quota reached in {', '.join(sorted(quota_full_regions))}; continuing in remaining regions.")
+
     successes.sort(key=lambda item: zone_rank.get(item[0], 999))
     return successes, rate_limited
 
@@ -435,7 +459,7 @@ def parse_args():
     global PROJECT_ID, SHARE_WITH_PROJECT, TARGET_VM_COUNT, PER_RESERVATION_VM_COUNT
     global DEFAULT_MACHINE_TYPES, DEFAULT_ACCELERATOR_TYPE, DEFAULT_ACCELERATOR_COUNT
     global DEFAULT_REGIONS, CUSTOM_ZONES
-    global MAX_WAVES, WAVE_INTERVAL_SECONDS
+    global MAX_WAVES, WAVE_INTERVAL_SECONDS, MAX_HUNT_HOURS
     parser = argparse.ArgumentParser(description="Ultra-Fast 1-VM Sniper & Multi-Zone Parallel GPU Hunter")
     parser.add_argument("--project", default=PROJECT_ID, help="Target GCP Host Project ID (default: prj-d-gai-launchpad)")
     parser.add_argument("--share-with", default=SHARE_WITH_PROJECT, help="Project ID to share reservation with (default: prj-d-gai-aipgaisvc-1)")
@@ -465,9 +489,20 @@ def parse_args():
         default=CUSTOM_ZONES,
         help="Optional comma-separated explicit zone list (overrides --regions)",
     )
-    parser.add_argument("--target-vms", type=int, default=TARGET_VM_COUNT, help="Total VMs to reserve (default: 3)")
-    parser.add_argument("--per-reservation-vms", type=int, default=PER_RESERVATION_VM_COUNT, help="VMs per individual reservation request (default: 1)")
+    parser.add_argument(
+        "--target-vms",
+        type=int,
+        default=TARGET_VM_COUNT,
+        help="Total new VMs to reserve (default: 9, i.e. 12 desired minus 3 already secured; every 1-VM hit is kept immediately)",
+    )
+    parser.add_argument(
+        "--per-reservation-vms",
+        type=int,
+        default=PER_RESERVATION_VM_COUNT,
+        help="VMs per individual reservation request (default: 1 so every single available node is grabbed immediately)",
+    )
     parser.add_argument("--max-waves", type=int, default=MAX_WAVES, help="Stop after N waves (0 = run until target met)")
+    parser.add_argument("--max-hunt-hours", type=float, default=MAX_HUNT_HOURS, help="Max hours to keep hunting (default: 24)")
     parser.add_argument("--wave-interval", type=float, default=WAVE_INTERVAL_SECONDS, help="Seconds between waves (default: 20)")
     args, _ = parser.parse_known_args()
 
@@ -481,7 +516,25 @@ def parse_args():
     TARGET_VM_COUNT = args.target_vms
     PER_RESERVATION_VM_COUNT = args.per_reservation_vms
     MAX_WAVES = args.max_waves
+    MAX_HUNT_HOURS = args.max_hunt_hours
     WAVE_INTERVAL_SECONDS = args.wave_interval
+
+
+def print_summary(secured_reservations: list, secured_vms: int, interrupted: bool = False):
+    log("\n" + "=" * 78)
+    if secured_vms >= TARGET_VM_COUNT:
+        log(f"SUCCESS! Secured all {secured_vms}/{TARGET_VM_COUNT} requested GPU VMs:")
+    elif interrupted:
+        log(f"STOPPED BY USER (Ctrl+C): Kept {secured_vms}/{TARGET_VM_COUNT} GPU VMs grabbed so far:")
+    else:
+        log(f"HUNTING ENDED: Kept {secured_vms}/{TARGET_VM_COUNT} GPU VMs grabbed so far:")
+
+    if secured_reservations:
+        for r in secured_reservations:
+            log(f"  - ACTIVE Reservation: {r['name']} | Zone: {r['zone']} | {r['vm_count']}x {r['machine_type']}")
+    else:
+        log("  - (No new reservations secured yet)")
+    log("=" * 78)
 
 
 def main():
@@ -501,9 +554,10 @@ def main():
     log(f"  Shared With:         {SHARE_WITH_PROJECT or '(None - single project)'} (ALLOW_ALL)")
     log(f"  Machine Types:       {DEFAULT_MACHINE_TYPES}")
     log(f"  Target Regions:      {CUSTOM_ZONES if CUSTOM_ZONES else DEFAULT_REGIONS}")
-    log(f"  Target Quantity:     {TARGET_VM_COUNT} VMs total (hunting {PER_RESERVATION_VM_COUNT} VM per reservation)")
+    log(f"  Target Quantity:     Up to {TARGET_VM_COUNT} new VMs (grabbing {PER_RESERVATION_VM_COUNT} VM at a time — incremental lock-in)")
+    log(f"  Incremental Grab:    Every 1-VM hit is immediately ACTIVE & KEPT (safe to Ctrl+C anytime)")
     log(f"  Hot-Zone Double-Tap: ENABLED (in-thread 0s burst without waiting for slow zones)")
-    log(f"  Wave Interval:       {WAVE_INTERVAL_SECONDS}s (+0..{JITTER_SECONDS}s jitter)")
+    log(f"  Wave Interval:       {WAVE_INTERVAL_SECONDS}s (+0..{JITTER_SECONDS}s jitter) | Max Hunt: {MAX_HUNT_HOURS}h")
     for t in tiers:
         log(f"  {t['name']} ({t['accelerator_count']}x {t['accelerator_type']}): {', '.join(t['zones'])}")
     log("=" * 78)
@@ -520,71 +574,76 @@ def main():
     wave_num = 0
     backoff_multiplier = 1.0
     start_time = time.time()
-    deadline = start_time + (MAX_HUNT_HOURS * 3600)
+    deadline = start_time + (MAX_HUNT_HOURS * 3600) if MAX_HUNT_HOURS > 0 else float("inf")
 
-    while secured_vms < TARGET_VM_COUNT and time.time() < deadline:
-        wave_num += 1
-        remaining = TARGET_VM_COUNT - secured_vms
-        log(f"\n--- Wave #{wave_num} | Need {remaining} more VM(s) (Secured: {secured_vms}/{TARGET_VM_COUNT}) ---")
+    stop_requested = False
 
-        any_rate_limit = False
-        active_tiers = [t for t in tiers if t["zones"]]
-        if not active_tiers:
-            log("STOPPED: All candidate zones were pruned (0 quota or unsupported machine family).")
-            break
+    def handle_sig(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+        log("\nSignal received — finishing current in-flight check and keeping all reservations grabbed so far...")
 
-        for tier in active_tiers:
-            if secured_vms >= TARGET_VM_COUNT:
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+
+    try:
+        while secured_vms < TARGET_VM_COUNT and time.time() < deadline and not stop_requested:
+            wave_num += 1
+            remaining = TARGET_VM_COUNT - secured_vms
+            log(f"\n--- Wave #{wave_num} | Grabbed {secured_vms}/{TARGET_VM_COUNT} new VMs so far (hunting up to {remaining} more) ---")
+
+            any_rate_limit = False
+            active_tiers = [t for t in tiers if t["zones"]]
+            if not active_tiers:
+                log("STOPPED: All candidate zones reached quota limit or were pruned.")
                 break
 
-            needed = TARGET_VM_COUNT - secured_vms
-            req_count = min(PER_RESERVATION_VM_COUNT, needed)
-            log(f"Probing {tier['name']} ({req_count}x {tier['machine_type']} per zone) across {len(tier['zones'])} zones in parallel...")
-            hits, rl = run_parallel_wave(tier, req_count, needed, token_mgr)
-            if rl:
-                any_rate_limit = True
+            for tier in active_tiers:
+                if secured_vms >= TARGET_VM_COUNT or stop_requested:
+                    break
 
-            for zone, res_name, count in hits:
-                if secured_vms + count <= TARGET_VM_COUNT:
-                    secured_vms += count
-                    secured_reservations.append({
-                        "zone": zone,
-                        "name": res_name,
-                        "machine_type": tier["machine_type"],
-                        "vm_count": count,
-                    })
-                else:
-                    delete_reservation(zone, res_name, token_mgr.get_token())
+                needed = TARGET_VM_COUNT - secured_vms
+                req_count = min(PER_RESERVATION_VM_COUNT, needed)
+                log(f"Probing {tier['name']} ({req_count}x {tier['machine_type']} per zone) across {len(tier['zones'])} zones in parallel...")
+                hits, rl = run_parallel_wave(tier, req_count, needed, secured_vms, token_mgr)
+                if rl:
+                    any_rate_limit = True
 
-        if secured_vms >= TARGET_VM_COUNT:
-            break
-        if MAX_WAVES > 0 and wave_num >= MAX_WAVES:
-            break
+                for zone, res_name, count in hits:
+                    if secured_vms + count <= TARGET_VM_COUNT:
+                        secured_vms += count
+                        secured_reservations.append({
+                            "zone": zone,
+                            "name": res_name,
+                            "machine_type": tier["machine_type"],
+                            "vm_count": count,
+                        })
+                    else:
+                        delete_reservation(zone, res_name, token_mgr.get_token())
 
-        if any_rate_limit:
-            backoff_multiplier = min(backoff_multiplier * 1.8, 4.0)
-            wait_secs = (WAVE_INTERVAL_SECONDS * backoff_multiplier) + random.uniform(1, 5)
-            log(f"Rate limit detected — backing off for {wait_secs:.1f}s...")
-        else:
-            backoff_multiplier = max(1.0, backoff_multiplier * 0.8)
-            wait_secs = WAVE_INTERVAL_SECONDS + random.uniform(0, JITTER_SECONDS)
-            log(f"Wave #{wave_num} complete ({secured_vms}/{TARGET_VM_COUNT} secured). Sleeping {wait_secs:.1f}s before next wave...")
+            if secured_vms >= TARGET_VM_COUNT or stop_requested:
+                break
+            if MAX_WAVES > 0 and wave_num >= MAX_WAVES:
+                break
 
-        time.sleep(wait_secs)
+            if any_rate_limit:
+                backoff_multiplier = min(backoff_multiplier * 1.8, 4.0)
+                wait_secs = (WAVE_INTERVAL_SECONDS * backoff_multiplier) + random.uniform(1, 5)
+                log(f"Rate limit detected — backing off for {wait_secs:.1f}s...")
+            else:
+                backoff_multiplier = max(1.0, backoff_multiplier * 0.8)
+                wait_secs = WAVE_INTERVAL_SECONDS + random.uniform(0, JITTER_SECONDS)
+                log(f"Wave #{wave_num} complete ({secured_vms}/{TARGET_VM_COUNT} grabbed so far). Sleeping {wait_secs:.1f}s before next wave...")
 
-    log("\n" + "=" * 78)
-    if secured_vms >= TARGET_VM_COUNT:
-        log(f"SUCCESS! Secured all {secured_vms}/{TARGET_VM_COUNT} requested GPU VMs:")
-        for r in secured_reservations:
-            log(f"  - Reservation: {r['name']} | Zone: {r['zone']} | {r['vm_count']}x {r['machine_type']}")
-        log("=" * 78)
-        sys.exit(0)
-    else:
-        log(f"STOPPED: Hunting window ended with {secured_vms}/{TARGET_VM_COUNT} VMs secured.")
-        for r in secured_reservations:
-            log(f"  - Partial Reservation: {r['name']} | Zone: {r['zone']} | {r['vm_count']}x {r['machine_type']}")
-        log("=" * 78)
-        sys.exit(1)
+            for _ in range(int(wait_secs * 2)):
+                if stop_requested:
+                    break
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        stop_requested = True
+
+    print_summary(secured_reservations, secured_vms, interrupted=stop_requested)
+    sys.exit(0 if secured_vms > 0 else 1)
 
 
 if __name__ == "__main__":
